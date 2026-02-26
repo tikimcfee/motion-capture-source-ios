@@ -114,6 +114,32 @@ vertex ColorInOut anchorGeometryVertexTransform(Vertex in [[stage_in]],
     return out;
 }
 
+// MARK: - Hand Overlay Shaders
+
+typedef struct {
+    float4 position [[position]];
+    float4 color;
+    float pointSize [[point_size]];
+} HandOverlayOut;
+
+// Hand overlay vertex shader — screen-space, no model/view/projection
+vertex HandOverlayOut handOverlayVertex(uint vid [[vertex_id]],
+                                        constant HandOverlayVertex *vertices [[buffer(0)]]) {
+    HandOverlayOut out;
+    out.position = float4(vertices[vid].position, 0.0, 1.0);
+    out.color = vertices[vid].color;
+    out.pointSize = 12.0;
+    return out;
+}
+
+// Hand overlay fragment shader — flat color, no lighting
+fragment float4 handOverlayFragment(HandOverlayOut in [[stage_in]]) {
+    return in.color;
+}
+
+
+// MARK: - Anchor Geometry Shaders
+
 // Anchor geometry fragment function
 fragment float4 anchorGeometryFragmentLighting(ColorInOut in [[stage_in]],
                                                constant SharedUniforms &uniforms [[ buffer(kBufferIndexSharedUniforms) ]]) {

@@ -59,4 +59,10 @@ typedef struct {
     matrix_float4x4 modelMatrix;
 } InstanceUniforms;
 
+// Vertex for hand overlay rendering (screen-space, flat color)
+typedef struct {
+    vector_float2 position; // NDC position [-1, 1]
+    vector_float4 color;
+} HandOverlayVertex;
+
 #endif /* ShaderTypes_h */

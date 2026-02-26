@@ -400,6 +400,7 @@
 				DEVELOPMENT_TEAM = XR2HQNSZ68;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = CAMERA_USAGE_DESCRIPTION;
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "MotionSource streams hand tracking data to devices on your local network.";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UIMainStoryboardFile = Main;
 				INFOPLIST_KEY_UIRequiredDeviceCapabilities = "arkit metal";
@@ -436,6 +437,7 @@
 				DEVELOPMENT_TEAM = XR2HQNSZ68;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = CAMERA_USAGE_DESCRIPTION;
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "MotionSource streams hand tracking data to devices on your local network.";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UIMainStoryboardFile = Main;
 				INFOPLIST_KEY_UIRequiredDeviceCapabilities = "arkit metal";

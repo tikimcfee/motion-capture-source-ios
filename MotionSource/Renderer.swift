@@ -24,6 +24,11 @@ let kMaxBuffersInFlight: Int = 3
 // The max number anchors our uniform buffer will hold
 let kMaxAnchorInstanceCount: Int = 64
 
+// Hand overlay: max 2 hands × 21 joints = 42 point vertices,
+// 2 hands × 21 connections × 2 endpoints = 84 line vertices
+let kMaxHandPointVertices: Int = 42
+let kMaxHandLineVertices: Int = 84
+
 // The 16 byte aligned size of our uniform structures
 let kAlignedSharedUniformsSize: Int = (MemoryLayout<SharedUniforms>.size & ~0xFF) + 0x100
 let kAlignedInstanceUniformsSize: Int = ((MemoryLayout<InstanceUniforms>.size * kMaxAnchorInstanceCount) & ~0xFF) + 0x100
@@ -89,6 +94,53 @@ class Renderer {
     
     // Flag for viewport size changes
     var viewportSizeDidChange: Bool = false
+
+    // Display transform for mapping image coords → screen coords
+    var imageDisplayTransform: CGAffineTransform = .identity
+
+    // Hand overlay rendering
+    var handOverlayPipelineState: MTLRenderPipelineState!
+    var handOverlayDepthState: MTLDepthStencilState!
+    var handPointVertexBuffer: MTLBuffer!
+    var handLineVertexBuffer: MTLBuffer!
+    var handPointVertexCount: Int = 0
+    var handLineVertexCount: Int = 0
+    var handObservations: [HandObservation] = []
+
+    // Skeleton connections matching HandData.js SKELETON_CONNECTIONS
+    static let skeletonConnections: [(Int, Int)] = [
+        (0, 1), (1, 2), (2, 3), (3, 4),        // Thumb
+        (0, 5), (5, 6), (6, 7), (7, 8),        // Index
+        (0, 9), (9, 10), (10, 11), (11, 12),   // Middle
+        (0, 13), (13, 14), (14, 15), (15, 16), // Ring
+        (0, 17), (17, 18), (18, 19), (19, 20), // Pinky
+        (5, 9), (9, 13), (13, 17),             // Palm
+    ]
+
+    // Per-joint colors by finger group
+    static let jointColors: [SIMD4<Float>] = [
+        SIMD4(1.0, 1.0, 1.0, 1.0),    // 0  Wrist — white
+        SIMD4(1.0, 0.3, 0.3, 1.0),    // 1  Thumb — red
+        SIMD4(1.0, 0.3, 0.3, 1.0),    // 2
+        SIMD4(1.0, 0.3, 0.3, 1.0),    // 3
+        SIMD4(1.0, 0.3, 0.3, 1.0),    // 4
+        SIMD4(0.3, 1.0, 0.3, 1.0),    // 5  Index — green
+        SIMD4(0.3, 1.0, 0.3, 1.0),    // 6
+        SIMD4(0.3, 1.0, 0.3, 1.0),    // 7
+        SIMD4(0.3, 1.0, 0.3, 1.0),    // 8
+        SIMD4(0.3, 0.5, 1.0, 1.0),    // 9  Middle — blue
+        SIMD4(0.3, 0.5, 1.0, 1.0),    // 10
+        SIMD4(0.3, 0.5, 1.0, 1.0),    // 11
+        SIMD4(0.3, 0.5, 1.0, 1.0),    // 12
+        SIMD4(1.0, 1.0, 0.3, 1.0),    // 13 Ring — yellow
+        SIMD4(1.0, 1.0, 0.3, 1.0),    // 14
+        SIMD4(1.0, 1.0, 0.3, 1.0),    // 15
+        SIMD4(1.0, 1.0, 0.3, 1.0),    // 16
+        SIMD4(1.0, 0.3, 1.0, 1.0),    // 17 Pinky — magenta
+        SIMD4(1.0, 0.3, 1.0, 1.0),    // 18
+        SIMD4(1.0, 0.3, 1.0, 1.0),    // 19
+        SIMD4(1.0, 0.3, 1.0, 1.0),    // 20
+    ]
     
     
     init(session: ARSession, metalDevice device: MTLDevice, renderDestination: RenderDestinationProvider) {
@@ -138,6 +190,7 @@ class Renderer {
                 
                 drawCapturedImage(renderEncoder: renderEncoder)
                 drawAnchorGeometry(renderEncoder: renderEncoder)
+                drawHandOverlay(renderEncoder: renderEncoder)
                 
                 // We're done encoding commands
                 renderEncoder.endEncoding()
@@ -290,6 +343,50 @@ class Renderer {
         anchorDepthStateDescriptor.isDepthWriteEnabled = true
         anchorDepthState = device.makeDepthStencilState(descriptor: anchorDepthStateDescriptor)
         
+        // Hand overlay pipeline — flat color, no depth test, drawn on top
+        let handOverlayVertexFunction = defaultLibrary.makeFunction(name: "handOverlayVertex")!
+        let handOverlayFragmentFunction = defaultLibrary.makeFunction(name: "handOverlayFragment")!
+
+        let handOverlayPipelineDescriptor = MTLRenderPipelineDescriptor()
+        handOverlayPipelineDescriptor.label = "HandOverlayPipeline"
+        handOverlayPipelineDescriptor.rasterSampleCount = renderDestination.sampleCount
+        handOverlayPipelineDescriptor.vertexFunction = handOverlayVertexFunction
+        handOverlayPipelineDescriptor.fragmentFunction = handOverlayFragmentFunction
+        handOverlayPipelineDescriptor.colorAttachments[0].pixelFormat = renderDestination.colorPixelFormat
+        handOverlayPipelineDescriptor.depthAttachmentPixelFormat = renderDestination.depthStencilPixelFormat
+        handOverlayPipelineDescriptor.stencilAttachmentPixelFormat = renderDestination.depthStencilPixelFormat
+        // Enable alpha blending
+        handOverlayPipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
+        handOverlayPipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
+        handOverlayPipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
+        handOverlayPipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        handOverlayPipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+
+        do {
+            try handOverlayPipelineState = device.makeRenderPipelineState(descriptor: handOverlayPipelineDescriptor)
+        } catch let error {
+            print("Failed to create hand overlay pipeline state, error \(error)")
+        }
+
+        // Depth state: always pass (draw on top of everything)
+        let handOverlayDepthDescriptor = MTLDepthStencilDescriptor()
+        handOverlayDepthDescriptor.depthCompareFunction = .always
+        handOverlayDepthDescriptor.isDepthWriteEnabled = false
+        handOverlayDepthState = device.makeDepthStencilState(descriptor: handOverlayDepthDescriptor)
+
+        // Allocate vertex buffers for hand overlay
+        handPointVertexBuffer = device.makeBuffer(
+            length: MemoryLayout<HandOverlayVertex>.stride * kMaxHandPointVertices,
+            options: .storageModeShared
+        )
+        handPointVertexBuffer.label = "HandPointVertexBuffer"
+
+        handLineVertexBuffer = device.makeBuffer(
+            length: MemoryLayout<HandOverlayVertex>.stride * kMaxHandLineVertices,
+            options: .storageModeShared
+        )
+        handLineVertexBuffer.label = "HandLineVertexBuffer"
+
         // Create the command queue
         commandQueue = device.makeCommandQueue()
     }
@@ -348,10 +445,15 @@ class Renderer {
         updateSharedUniforms(frame: currentFrame)
         updateAnchors(frame: currentFrame)
         updateCapturedImageTextures(frame: currentFrame)
-        
+
+        // Store the image→display transform so the hand overlay matches the camera feed
+        imageDisplayTransform = currentFrame.displayTransform(for: .landscapeRight, viewportSize: viewportSize)
+
+        updateHandOverlay()
+
         if viewportSizeDidChange {
             viewportSizeDidChange = false
-            
+
             updateImagePlane(frame: currentFrame)
         }
     }
@@ -407,6 +509,66 @@ class Renderer {
         }
     }
     
+    func updateHandOverlay() {
+        let observations = handObservations
+        guard !observations.isEmpty else {
+            handPointVertexCount = 0
+            handLineVertexCount = 0
+            return
+        }
+
+        let pointPtr = handPointVertexBuffer.contents().assumingMemoryBound(to: HandOverlayVertex.self)
+        let linePtr = handLineVertexBuffer.contents().assumingMemoryBound(to: HandOverlayVertex.self)
+        var pointCount = 0
+        var lineCount = 0
+
+        for obs in observations {
+            guard obs.landmarks.count == 21 else { continue }
+
+            // Convert landmarks to NDC positions
+            // HandTracker gives: x in [0,1], y in [0,1] (top-to-bottom, Y-flipped from Vision)
+            // These are in raw image space — apply displayTransform to match screen orientation
+            // Then map to NDC: [-1,1] with Y up
+            var ndcPositions: [SIMD2<Float>] = []
+            for lm in obs.landmarks {
+                let isZero = lm[0] == 0 && lm[1] == 0 && lm[2] == 0
+                if isZero {
+                    ndcPositions.append(SIMD2<Float>(Float.nan, Float.nan))
+                } else {
+                    let imgPt = CGPoint(x: CGFloat(lm[0]), y: CGFloat(lm[1]))
+                    let displayPt = imgPt.applying(imageDisplayTransform)
+                    let ndcX = Float(displayPt.x) * 2.0 - 1.0
+                    let ndcY = -(Float(displayPt.y) * 2.0 - 1.0)
+                    ndcPositions.append(SIMD2<Float>(ndcX, ndcY))
+                }
+            }
+
+            // Write joint point vertices
+            for (jointIdx, ndc) in ndcPositions.enumerated() {
+                guard !ndc.x.isNaN, pointCount < kMaxHandPointVertices else { continue }
+                let color = Self.jointColors[jointIdx]
+                pointPtr[pointCount] = HandOverlayVertex(position: ndc, color: color)
+                pointCount += 1
+            }
+
+            // Write skeleton line vertices
+            for (startIdx, endIdx) in Self.skeletonConnections {
+                let startNdc = ndcPositions[startIdx]
+                let endNdc = ndcPositions[endIdx]
+                guard !startNdc.x.isNaN, !endNdc.x.isNaN, lineCount + 2 <= kMaxHandLineVertices else { continue }
+                // Use color of the "child" joint for the bone
+                let color = Self.jointColors[endIdx]
+                let lineColor = SIMD4<Float>(color.x, color.y, color.z, 0.8)
+                linePtr[lineCount] = HandOverlayVertex(position: startNdc, color: lineColor)
+                linePtr[lineCount + 1] = HandOverlayVertex(position: endNdc, color: lineColor)
+                lineCount += 2
+            }
+        }
+
+        handPointVertexCount = pointCount
+        handLineVertexCount = lineCount
+    }
+
     func updateCapturedImageTextures(frame: ARFrame) {
         // Create two textures (Y and CbCr) from the provided frame's captured image
         let pixelBuffer = frame.capturedImage
@@ -502,6 +664,29 @@ class Renderer {
             renderEncoder.drawIndexedPrimitives(type: submesh.primitiveType, indexCount: submesh.indexCount, indexType: submesh.indexType, indexBuffer: submesh.indexBuffer.buffer, indexBufferOffset: submesh.indexBuffer.offset, instanceCount: anchorInstanceCount)
         }
         
+        renderEncoder.popDebugGroup()
+    }
+
+    func drawHandOverlay(renderEncoder: MTLRenderCommandEncoder) {
+        guard handPointVertexCount > 0 || handLineVertexCount > 0 else { return }
+
+        renderEncoder.pushDebugGroup("DrawHandOverlay")
+        renderEncoder.setCullMode(.none)
+        renderEncoder.setRenderPipelineState(handOverlayPipelineState)
+        renderEncoder.setDepthStencilState(handOverlayDepthState)
+
+        // Draw skeleton lines
+        if handLineVertexCount > 0 {
+            renderEncoder.setVertexBuffer(handLineVertexBuffer, offset: 0, index: 0)
+            renderEncoder.drawPrimitives(type: .line, vertexStart: 0, vertexCount: handLineVertexCount)
+        }
+
+        // Draw joint points
+        if handPointVertexCount > 0 {
+            renderEncoder.setVertexBuffer(handPointVertexBuffer, offset: 0, index: 0)
+            renderEncoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: handPointVertexCount)
+        }
+
         renderEncoder.popDebugGroup()
     }
 }
