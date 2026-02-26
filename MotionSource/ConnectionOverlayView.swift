@@ -9,6 +9,11 @@ struct ConnectionOverlayView: View {
     @Bindable var viewModel: ConnectionViewModel
 
     var body: some View {
+        rootContent
+            .onAppear { viewModel.onAppear() }
+    }
+    
+    private var rootContent: some View {
         VStack {
             Spacer()
 
@@ -63,7 +68,7 @@ struct ConnectionOverlayView: View {
             .padding(.bottom, 8)
         }
     }
-
+    
     private var statusDot: some View {
         Circle()
             .fill(dotColor)

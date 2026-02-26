@@ -50,7 +50,11 @@ class ViewController: UIViewController, MTKViewDelegate, ARSessionDelegate {
         view.addGestureRecognizer(tapGesture)
 
         // Hand tracking
-        handTracker = HandTracker()
+        let computedMode = depthMode(for: preferredDepthSemantic)
+        print("Starting hand tracking with mode: \(computedMode)")
+        handTracker = HandTracker(
+            depthMode: computedMode
+        )
         handTracker.onHandsDetected = { [weak self] observations, scene, timestamp in
             Task { @MainActor [weak self] in
                 self?.sendHandFrame(observations: observations, scene: scene, timestamp: timestamp)
@@ -83,15 +87,32 @@ class ViewController: UIViewController, MTKViewDelegate, ARSessionDelegate {
         ])
         hostingController.didMove(toParent: self)
     }
+    
+    var preferredDepthSemantic: ARConfiguration.FrameSemantics? {
+        // Enable LiDAR scene depth — prefer smoothed for temporal stability
+        return if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+            ARConfiguration.FrameSemantics.smoothedSceneDepth
+        } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            ARConfiguration.FrameSemantics.sceneDepth
+        } else {
+            nil
+        }
+    }
+    
+    func depthMode(for semantic: ARConfiguration.FrameSemantics?) -> HandTracker.DepthMode {
+        return switch semantic {
+        case .smoothedSceneDepth: .smoothed
+        case .sceneDepth: .raw
+        default: .noDepth
+        }
+    }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
 
         let configuration = ARWorldTrackingConfiguration()
-
-        // Enable LiDAR scene depth if available
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            configuration.frameSemantics.insert(.sceneDepth)
+        if let preferredDepthSemantic {
+            configuration.frameSemantics.insert(preferredDepthSemantic)
         }
 
         session.run(configuration)
@@ -158,7 +179,7 @@ class ViewController: UIViewController, MTKViewDelegate, ARSessionDelegate {
         let message = HandFrameMessage(
             hands: observations,
             timestamp: timestamp,
-            scene: ScenePayload(from: scene)
+            scene: ScenePayload(from: scene, observations: observations)
         )
 
         guard let jsonString = MessageEncoder.encode(message) else { return }

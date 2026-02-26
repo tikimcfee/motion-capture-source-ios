@@ -5,6 +5,32 @@
 
 import Foundation
 import Observation
+import Synchronization
+
+actor DoOnce {
+    let didRun = Mutex(false)
+    
+    nonisolated func execute(_ action: () -> Void) {
+        let didRun = self.didRun.withLock { $0 }
+        guard !didRun else { return }
+        self.didRun.withLock { $0 = true }
+        action()
+    }
+    
+    nonisolated func execute(_ action: () async -> Void) async {
+        let didRun = self.didRun.withLock { $0 }
+        guard !didRun else { return }
+        self.didRun.withLock { $0 = true }
+        await action()
+    }
+    
+    nonisolated func execute(_ action: () async throws -> Void) async throws {
+        let didRun = self.didRun.withLock { $0 }
+        guard !didRun else { return }
+        self.didRun.withLock { $0 = true }
+        try await action()
+    }
+}
 
 @Observable
 class ConnectionViewModel {
@@ -14,6 +40,9 @@ class ConnectionViewModel {
     var deviceIP: String = "unknown"
 
     let webSocketClient = WebSocketClient()
+    let onAppearOnce = DoOnce()
+    
+
 
     init() {
         webSocketClient.onStateChanged = { [weak self] newState in
@@ -22,6 +51,13 @@ class ConnectionViewModel {
             }
         }
         refreshDeviceIP()
+    }
+    
+    func onAppear() {
+        onAppearOnce.execute {
+            guard state == .disconnected else { return }
+            webSocketClient.connect(to: address)
+        }
     }
 
     func toggleConnection() {

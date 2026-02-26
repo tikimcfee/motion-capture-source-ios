@@ -38,20 +38,50 @@ struct ScenePayload: Encodable {
     let cameraTransform: [[Float]]
     let trackingState: String
     let lightIntensity: Float
+    let viewport: ViewportPayload
 
-    init(from ctx: SceneContext) {
-        intrinsics = IntrinsicsPayload(
-            fx: ctx.intrinsicsFx,
-            fy: ctx.intrinsicsFy,
-            cx: ctx.intrinsicsCx,
-            cy: ctx.intrinsicsCy
-        )
+    // High-water-mark depth range — only expands, never shrinks.
+    // Converges to the camera's effective hand tracking volume over time.
+    private static var hwmMinZ: Float = .greatestFiniteMagnitude
+    private static var hwmMaxZ: Float = 0
+
+    init(from ctx: SceneContext, observations: [HandObservation]) {
+        let fx = ctx.intrinsicsFx
+        let fy = ctx.intrinsicsFy
+        let w = Float(ctx.imageWidth)
+        let h = Float(ctx.imageHeight)
+
+        intrinsics = IntrinsicsPayload(fx: fx, fy: fy, cx: ctx.intrinsicsCx, cy: ctx.intrinsicsCy)
         imageResolution = [ctx.imageWidth, ctx.imageHeight]
         cameraTransform = stride(from: 0, to: 16, by: 4).map {
             Array(ctx.cameraTransform[$0 ..< $0 + 4])
         }
         trackingState = ctx.trackingState
         lightIntensity = ctx.lightIntensity
+
+        // Derive viewport from intrinsics
+        let fovH = 2.0 * atan(w / (2.0 * fx))
+        let fovV = 2.0 * atan(h / (2.0 * fy))
+
+        // Expand high-water-mark from observed hand depths (only grows, never shrinks)
+        for obs in observations {
+            for lm in obs.landmarks {
+                let z = lm[2]
+                guard z > 0 else { continue }
+                Self.hwmMinZ = min(Self.hwmMinZ, z)
+                Self.hwmMaxZ = max(Self.hwmMaxZ, z)
+            }
+        }
+        let hasDepth = Self.hwmMinZ <= Self.hwmMaxZ
+
+        viewport = ViewportPayload(
+            fovHorizontal: fovH,
+            fovVertical: fovV,
+            aspectRatio: w / h,
+            physicalWidth: w / fx,   // meters visible at 1m depth
+            physicalHeight: h / fy,
+            depthRange: hasDepth ? [Self.hwmMinZ, Self.hwmMaxZ] : [0, 0]
+        )
     }
 }
 
@@ -60,6 +90,15 @@ struct IntrinsicsPayload: Encodable {
     let fy: Float
     let cx: Float
     let cy: Float
+}
+
+struct ViewportPayload: Encodable {
+    let fovHorizontal: Float   // radians
+    let fovVertical: Float     // radians
+    let aspectRatio: Float
+    let physicalWidth: Float   // meters at 1m depth
+    let physicalHeight: Float  // meters at 1m depth
+    let depthRange: [Float]    // [minZ, maxZ] high-water-mark of observed depths, meters
 }
 
 // MARK: - Camera Frame Message

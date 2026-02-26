@@ -48,14 +48,51 @@ nonisolated class HandTracker: @unchecked Sendable {
     private let visionQueue = DispatchQueue(label: "com.motionsource.vision", qos: .userInitiated)
     private var isProcessing = false
     private let handPoseRequest: VNDetectHumanHandPoseRequest
-    let supportsDepth: Bool
+    var depthMode: DepthMode
+
+    // Per-joint EMA smoothing — alpha=1 means raw (no smoothing), lower = more smoothing.
+    // Tips get heavier smoothing to tame jitter; wrist/MCPs stay responsive.
+    private static let jointAlpha: [Float] = [
+        0.7,                    // 0  WRIST
+        0.7, 0.6, 0.5, 0.35,   // 1-4  THUMB  (CMC → TIP)
+        0.7, 0.6, 0.5, 0.35,   // 5-8  INDEX
+        0.7, 0.6, 0.5, 0.35,   // 9-12 MIDDLE
+        0.7, 0.6, 0.5, 0.35,   // 13-16 RING
+        0.7, 0.6, 0.5, 0.35,   // 17-20 PINKY
+    ]
+    private var previousLandmarks: [String: [[Float]]] = [:]  // keyed by handedness
+    private var didLogDepthMapSize = false
 
     var onHandsDetected: ((@Sendable ([HandObservation], SceneContext, TimeInterval) -> Void))?
+    
+    enum DepthMode {
+        case noDepth
+        case smoothed
+        case raw
+        
+        func depthData(for frame: ARFrame) -> ARDepthData? {
+            switch self {
+            case .smoothed:
+                frame.smoothedSceneDepth
+            case .raw:
+                frame.sceneDepth
+            case .noDepth:
+                nil
+            }
+        }
+        
+        static var isDepthAvailable: Bool {
+            ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth)
+            || ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+        }
+    }
 
-    init() {
+    init(
+        depthMode: DepthMode
+    ) {
+        self.depthMode = depthMode
         handPoseRequest = VNDetectHumanHandPoseRequest()
         handPoseRequest.maximumHandCount = 2
-        supportsDepth = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
     }
 
     func processFrame(_ frame: ARFrame) {
@@ -64,12 +101,15 @@ nonisolated class HandTracker: @unchecked Sendable {
 
         let pixelBuffer = frame.capturedImage
         let timestamp = frame.timestamp
-        let depthData = supportsDepth ? frame.smoothedSceneDepth : nil
+        let depthData = depthMode.depthData(for: frame)
 
         // Extract scene context on the calling thread (where ARFrame is valid)
         let camera = frame.camera
         let intrinsics = camera.intrinsics
         let imageRes = camera.imageResolution
+        let focalLengthX = intrinsics[0][0]
+        let imgWidth = Float(imageRes.width)
+        let imgHeight = Float(imageRes.height)
         let trackingState: String = {
             switch camera.trackingState {
             case .normal: return "normal"
@@ -124,8 +164,8 @@ nonisolated class HandTracker: @unchecked Sendable {
 
                             // Sample LiDAR depth at this joint's position
                             if let depthData = depthData {
-                                // Use un-flipped Y for depth sampling (depth map shares camera orientation)
-                                z = self.sampleDepth(depthData, normalizedX: Float(point.location.x), normalizedY: Float(point.location.y))
+                                // Flip Y for depth sampling — Vision origin is bottom-left, depth map is top-left
+                                z = self.sampleDepth(depthData, normalizedX: Float(point.location.x), normalizedY: Float(1.0 - point.location.y))
                             }
 
                             landmarks.append([x, y, z])
@@ -133,6 +173,37 @@ nonisolated class HandTracker: @unchecked Sendable {
                             landmarks.append([0, 0, 0])
                         }
                     }
+
+                    // Depth coherence clamp — prevent tips from stretching into background.
+                    // Use median depth of all valid joints as reference, clamp outliers.
+                    let validDepths = landmarks.compactMap { $0[2] > 0 ? $0[2] : nil }
+                    if validDepths.count >= 3 {
+                        let sorted = validDepths.sorted()
+                        let refDepth = sorted[sorted.count / 2]
+                        let maxDeviation: Float = 0.10  // 10cm — covers wrist-to-tip range for most poses
+                        for i in 0..<landmarks.count where landmarks[i][2] > 0 {
+                            landmarks[i][2] = min(max(landmarks[i][2], refDepth - maxDeviation), refDepth + maxDeviation)
+                        }
+                    }
+
+                    // Temporal EMA smoothing — blend with previous frame per joint
+                    if let prev = self.previousLandmarks[handedness], prev.count == landmarks.count {
+                        for i in 0..<landmarks.count {
+                            let cur = landmarks[i]
+                            let old = prev[i]
+                            // Skip if either is zeroed (undetected) — snap, don't blend
+                            let curDetected = cur[0] != 0 || cur[1] != 0
+                            let oldDetected = old[0] != 0 || old[1] != 0
+                            guard curDetected && oldDetected else { continue }
+                            let a = Self.jointAlpha[i]
+                            landmarks[i] = [
+                                a * cur[0] + (1 - a) * old[0],
+                                a * cur[1] + (1 - a) * old[1],
+                                a * cur[2] + (1 - a) * old[2],
+                            ]
+                        }
+                    }
+                    self.previousLandmarks[handedness] = landmarks
 
                     observations.append(HandObservation(handedness: handedness, landmarks: landmarks))
                 }
@@ -147,22 +218,53 @@ nonisolated class HandTracker: @unchecked Sendable {
         }
     }
 
+    /// Sample depth using median of a small kernel around the target point.
+    /// Median is robust to edge discontinuities (hand vs background) and
+    /// reduces per-pixel LiDAR noise, giving stabler joint depths.
+    private static let kernelRadius = 2  // 5x5 kernel
+
     private func sampleDepth(_ depthData: ARDepthData, normalizedX: Float, normalizedY: Float) -> Float {
         let depthMap = depthData.depthMap
         let width = CVPixelBufferGetWidth(depthMap)
         let height = CVPixelBufferGetHeight(depthMap)
+        if !didLogDepthMapSize {
+            didLogDepthMapSize = true
+            print("[HandTracker] Depth map size: \(width)x\(height)")
+        }
+        let r = Self.kernelRadius
 
-        let pixelX = min(max(Int(normalizedX * Float(width)), 0), width - 1)
-        let pixelY = min(max(Int(normalizedY * Float(height)), 0), height - 1)
+        let centerX = min(max(Int(normalizedX * Float(width)), 0), width - 1)
+        let centerY = min(max(Int(normalizedY * Float(height)), 0), height - 1)
 
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
 
         guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else { return 0.0 }
         let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
-        let pointer = baseAddress.advanced(by: pixelY * bytesPerRow + pixelX * MemoryLayout<Float32>.size)
-        let depth = pointer.assumingMemoryBound(to: Float32.self).pointee
+        let stride = MemoryLayout<Float32>.size
 
-        return depth.isNaN || depth.isInfinite ? 0.0 : depth
+        var samples: [Float] = []
+        let minY = max(centerY - r, 0)
+        let maxY = min(centerY + r, height - 1)
+        let minX = max(centerX - r, 0)
+        let maxX = min(centerX + r, width - 1)
+
+        for py in minY...maxY {
+            let rowBase = baseAddress.advanced(by: py * bytesPerRow)
+            for px in minX...maxX {
+                let d = rowBase.advanced(by: px * stride)
+                    .assumingMemoryBound(to: Float32.self).pointee
+                if !d.isNaN && !d.isInfinite && d > 0 {
+                    samples.append(d)
+                }
+            }
+        }
+
+        guard !samples.isEmpty else { return 0.0 }
+        samples.sort()
+        // Use near-minimum (2nd smallest) — the closest surface is the hand,
+        // not background bleed. Skipping the absolute min avoids single-pixel noise.
+        let index = min(1, samples.count - 1)
+        return samples[index]
     }
 }
