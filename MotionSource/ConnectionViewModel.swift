@@ -39,7 +39,10 @@ class ConnectionViewModel {
     /// is treated as a CLI controller with its frames parsed as commands.
     static let sourceGreeting = "SOURCE hand"
 
-    var address: String = "ws://192.168.50.249:8765"
+    /// Default relay endpoint. Port matches `glyph3d-cli serve` (8080); the host
+    /// is the Mac running the relay and is expected to be edited in the UI, since
+    /// it moves with DHCP.
+    var address: String = "ws://192.168.50.249:8080"
     var state: ConnectionState = .disconnected
     var handsDetected: Int = 0
     var deviceIP: String = "unknown"
