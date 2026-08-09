@@ -39,10 +39,18 @@ class ConnectionViewModel {
     /// is treated as a CLI controller with its frames parsed as commands.
     static let sourceGreeting = "SOURCE hand"
 
-    /// Default relay endpoint. Port matches `glyph3d-cli serve` (8080); the host
-    /// is the Mac running the relay and is expected to be edited in the UI, since
-    /// it moves with DHCP.
-    var address: String = "ws://192.168.50.249:8080"
+    /// Fallback relay endpoint, used only until a connection succeeds once. Port
+    /// matches `glyph3d-cli serve` (8080); the host moves with DHCP and is
+    /// expected to be edited in the UI.
+    static let defaultAddress = "ws://192.168.50.249:8080"
+
+    /// Where the last *successful* connection was made. Deliberately not written
+    /// on every edit: the address field is a live-bound TextField, so persisting
+    /// each keystroke would overwrite a known-good endpoint with whatever partial
+    /// text was on screen mid-typing. Written when the socket actually opens.
+    private static let addressKey = "relay.address"
+
+    var address: String = ConnectionViewModel.defaultAddress
     var state: ConnectionState = .disconnected
     var handsDetected: Int = 0
     var deviceIP: String = "unknown"
@@ -56,12 +64,26 @@ class ConnectionViewModel {
     let onAppearOnce = DoOnce()
 
     init() {
+        // Restore the last endpoint that worked. An empty stored value is treated
+        // as absent so a cleared field can't brick the next launch.
+        if let saved = UserDefaults.standard.string(forKey: Self.addressKey),
+           !saved.trimmingCharacters(in: .whitespaces).isEmpty {
+            address = saved
+        }
+
         webSocketClient.onStateChanged = { [weak self] newState in
             Task { @MainActor [weak self] in
-                self?.state = newState
-                // A dropped connection invalidates the assigned id; the relay
-                // issues a fresh one on reconnect.
-                if newState != .connected { self?.sourceId = nil }
+                guard let self else { return }
+                self.state = newState
+                if newState == .connected {
+                    // Only a real open proves the endpoint is reachable — that is
+                    // what's worth remembering for next launch.
+                    UserDefaults.standard.set(self.address, forKey: Self.addressKey)
+                } else {
+                    // A dropped connection invalidates the assigned id; the relay
+                    // issues a fresh one on reconnect.
+                    self.sourceId = nil
+                }
             }
         }
         webSocketClient.onRegistered = { [weak self] id in
