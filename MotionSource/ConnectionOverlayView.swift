@@ -25,6 +25,19 @@ struct ConnectionOverlayView: View {
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.white)
 
+                    // Relay-assigned source id. Its ABSENCE while connected is the
+                    // useful signal: the socket is healthy but the relay didn't
+                    // accept the SOURCE greeting, so frames are going nowhere.
+                    if let sourceId = viewModel.sourceId {
+                        Text(sourceId)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.green)
+                    } else if viewModel.isConnected {
+                        Text("unregistered")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.orange)
+                    }
+
                     Spacer()
 
                     Text("Hands: \(viewModel.handsDetected)")

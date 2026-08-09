@@ -34,39 +34,61 @@ actor DoOnce {
 
 @Observable
 class ConnectionViewModel {
+    /// The relay's sensor handshake. `SOURCE <kind>` must be the first message on
+    /// the wire — the relay classifies a client by it, and a device that skips it
+    /// is treated as a CLI controller with its frames parsed as commands.
+    static let sourceGreeting = "SOURCE hand"
+
     var address: String = "ws://192.168.50.249:8765"
     var state: ConnectionState = .disconnected
     var handsDetected: Int = 0
     var deviceIP: String = "unknown"
 
+    /// Relay-assigned id for this device (e.g. "src-hand-0"), once registered.
+    /// Nil until the ack lands — which is the signal the handshake was accepted,
+    /// distinct from the socket merely being open.
+    var sourceId: String?
+
     let webSocketClient = WebSocketClient()
     let onAppearOnce = DoOnce()
-    
-
 
     init() {
         webSocketClient.onStateChanged = { [weak self] newState in
             Task { @MainActor [weak self] in
                 self?.state = newState
+                // A dropped connection invalidates the assigned id; the relay
+                // issues a fresh one on reconnect.
+                if newState != .connected { self?.sourceId = nil }
+            }
+        }
+        webSocketClient.onRegistered = { [weak self] id in
+            Task { @MainActor [weak self] in
+                self?.sourceId = id
             }
         }
         refreshDeviceIP()
     }
-    
+
     func onAppear() {
         onAppearOnce.execute {
             guard state == .disconnected else { return }
-            webSocketClient.connect(to: address)
+            openConnection()
         }
     }
 
     func toggleConnection() {
         switch state {
         case .disconnected, .failed:
-            webSocketClient.connect(to: address)
+            openConnection()
         case .connecting, .connected:
             webSocketClient.disconnect()
         }
+    }
+
+    /// Single funnel for every connect, so no call site can open a socket without
+    /// announcing what this device is.
+    private func openConnection() {
+        webSocketClient.connect(to: address, greeting: Self.sourceGreeting)
     }
 
     func send(_ string: String) {

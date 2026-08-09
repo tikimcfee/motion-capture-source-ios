@@ -20,12 +20,28 @@ nonisolated class WebSocketClient: NSObject, URLSessionWebSocketDelegate, @unche
 
     var onStateChanged: ((@Sendable (ConnectionState) -> Void))?
 
+    /// Called with the relay's assigned source id once the handshake is accepted.
+    var onRegistered: ((@Sendable (String) -> Void))?
+
     override init() {
         super.init()
         urlSession = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
     }
 
-    func connect(to urlString: String) {
+    /// Open the connection, optionally announcing a role first.
+    ///
+    /// The relay classifies a client by its FIRST message: `DISPLAY` for the
+    /// browser, `SOURCE <kind>` for a sensor device, anything else for a CLI
+    /// controller. Send a hand frame first and this app gets classed a controller
+    /// and its frames parsed as command strings.
+    ///
+    /// The greeting is enqueued here, immediately after `resume()`, rather than in
+    /// the didOpen delegate callback. ARKit's hand-tracking callback pushes frames
+    /// without waiting for `.connected`, so a frame can be queued before the socket
+    /// finishes opening. URLSessionWebSocketTask preserves send order, so enqueuing
+    /// the greeting first makes it first on the wire by construction — no ordering
+    /// assumption about when the app starts streaming.
+    func connect(to urlString: String, greeting: String? = nil) {
         disconnect()
 
         guard let url = URL(string: urlString) else {
@@ -37,6 +53,9 @@ nonisolated class WebSocketClient: NSObject, URLSessionWebSocketDelegate, @unche
 
         webSocketTask = urlSession.webSocketTask(with: url)
         webSocketTask?.resume()
+        if let greeting {
+            send(greeting)
+        }
         listenForDisconnect()
     }
 
@@ -74,15 +93,43 @@ nonisolated class WebSocketClient: NSObject, URLSessionWebSocketDelegate, @unche
 
     // MARK: - Private
 
-    /// Keep a receive loop alive to detect server-side disconnects.
+    /// Keep a receive loop alive to detect server-side disconnects, and pick the
+    /// relay's registration ack out of the stream.
+    ///
+    /// The ack is the only on-device proof the greeting was accepted — a device
+    /// that got misclassified still shows a healthy socket, so "connected" alone
+    /// says nothing about whether frames are being understood.
     private func listenForDisconnect() {
         webSocketTask?.receive { [weak self] result in
             switch result {
-            case .success:
+            case .success(let message):
+                if case .string(let text) = message {
+                    self?.handleServerMessage(text)
+                }
                 self?.listenForDisconnect()
             case .failure:
                 break // delegate methods handle state
             }
+        }
+    }
+
+    /// Parse the relay ack: {"ok":true,"role":"source","sourceId":"src-hand-0",…}
+    private func handleServerMessage(_ text: String) {
+        guard let data = text.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let role = json["role"] as? String,
+              let sourceId = json["sourceId"] as? String
+        else { return }
+
+        guard role == "source" else {
+            print("[WebSocketClient] Relay classified this client as '\(role)', not a source")
+            return
+        }
+
+        print("[WebSocketClient] Registered as source '\(sourceId)'")
+        let callback = onRegistered
+        DispatchQueue.main.async {
+            callback?(sourceId)
         }
     }
 
