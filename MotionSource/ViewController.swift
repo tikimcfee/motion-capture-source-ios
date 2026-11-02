@@ -21,9 +21,30 @@ class ViewController: UIViewController, MTKViewDelegate, ARSessionDelegate {
     var handTracker: HandTracker!
     var cameraFrameStreamer: CameraFrameStreamer!
     var connectionViewModel: ConnectionViewModel!
+    let motionSensor = MotionSensor()
+
+    /// Capture pipeline, chosen at launch with `-pipeline avf|arkit`:
+    /// AVFoundation wide camera + LiDAR depth camera (default: the phone is static, so no world
+    /// tracking is needed, and it measured ~30 ms lower capture→send latency and far fewer
+    /// depthless joints than ARKit), or ARKit world tracking + sceneDepth.
+    enum Pipeline: String { case arkit, avf }
+    let pipeline: Pipeline = {
+        let requested = UserDefaults.standard.string(forKey: "pipeline").flatMap(Pipeline.init(rawValue:))
+        let wanted = requested ?? .avf
+        if wanted == .avf && !LiDARCapture.isAvailable { return .arkit }
+        return wanted
+    }()
+    private var lidarCapture: LiDARCapture?
+
+    /// The sourceId the first-hand cue last fired for: one cue per registered connection.
+    private var firstHandCuedFor: String?
 
     override func viewDidLoad() {
         super.viewDidLoad()
+
+        // Face-down, nobody touches the screen: never let it auto-lock and suspend the stream.
+        UIApplication.shared.isIdleTimerDisabled = true
+        motionSensor.start()
 
         // Set the view's delegate
         session = ARSession()
@@ -50,17 +71,11 @@ class ViewController: UIViewController, MTKViewDelegate, ARSessionDelegate {
         view.addGestureRecognizer(tapGesture)
 
         // Hand tracking
-        let computedMode = depthMode(for: preferredDepthSemantic)
+        let computedMode = HandTracker.DepthMode.preferred
         print("Starting hand tracking with mode: \(computedMode)")
         handTracker = HandTracker(
             depthMode: computedMode
         )
-        handTracker.onHandsDetected = { [weak self] observations, scene, timestamp in
-            Task { @MainActor [weak self] in
-                self?.sendHandFrame(observations: observations, scene: scene, timestamp: timestamp)
-            }
-            
-        }
 
         // Camera frame streamer
         cameraFrameStreamer = CameraFrameStreamer()
@@ -70,8 +85,39 @@ class ViewController: UIViewController, MTKViewDelegate, ARSessionDelegate {
             }
         }
 
+        print("[Pipeline] \(pipeline.rawValue)")
+        if pipeline == .avf {
+            let capture = LiDARCapture()
+            if capture.configure() {
+                let tracker = handTracker!, streamer = cameraFrameStreamer!
+                capture.onFrame = { pixelBuffer, depth, scene, timestamp, depthTimestamp, depthIsNew in
+                    streamer.processFrame(pixelBuffer: pixelBuffer, timestamp: timestamp)
+                    // A frame dropped here while Vision is busy may carry the only use of a new
+                    // depth map; the cloud then skips that depth (rate is reported in [Stats]).
+                    guard tracker.beginProcessing() else { return }
+                    tracker.track(pixelBuffer: pixelBuffer, depth: depth, scene: scene, timestamp: timestamp,
+                                  depthTimestamp: depthTimestamp, depthIsNew: depthIsNew)
+                }
+                lidarCapture = capture
+            } else {
+                print("[Pipeline] AVFoundation LiDAR setup failed; falling back to ARKit")
+            }
+        }
+
         // Connection view model + SwiftUI overlay
         connectionViewModel = ConnectionViewModel()
+
+        // Send from the tracking queue; only on-screen state goes through main.
+        let sender = FrameSender(client: connectionViewModel.webSocketClient, motion: motionSensor)
+        // Encoding a frame with its depth crop (~130 KB of JSON) takes milliseconds; doing it on
+        // its own serial queue lets the tracker take the next camera frame meanwhile.
+        let sendQueue = DispatchQueue(label: "com.motionsource.send", qos: .userInitiated)
+        handTracker.onFrameTracked = { [weak self] tracked in
+            sendQueue.async { sender.send(tracked) }
+            Task { @MainActor [weak self] in
+                self?.showTrackedFrame(tracked)
+            }
+        }
 
         let overlay = ConnectionOverlayView(viewModel: connectionViewModel)
         let hostingController = UIHostingController(rootView: overlay)
@@ -88,32 +134,18 @@ class ViewController: UIViewController, MTKViewDelegate, ARSessionDelegate {
         hostingController.didMove(toParent: self)
     }
     
-    var preferredDepthSemantic: ARConfiguration.FrameSemantics? {
-        // Enable LiDAR scene depth — prefer smoothed for temporal stability
-        return if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
-            ARConfiguration.FrameSemantics.smoothedSceneDepth
-        } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            ARConfiguration.FrameSemantics.sceneDepth
-        } else {
-            nil
-        }
-    }
-    
-    func depthMode(for semantic: ARConfiguration.FrameSemantics?) -> HandTracker.DepthMode {
-        return switch semantic {
-        case .smoothedSceneDepth: .smoothed
-        case .sceneDepth: .raw
-        default: .noDepth
-        }
-    }
-
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
 
-        let configuration = ARWorldTrackingConfiguration()
-        if let preferredDepthSemantic {
-            configuration.frameSemantics.insert(preferredDepthSemantic)
+        if let lidarCapture {
+            lidarCapture.start()
+            return
         }
+        let configuration = ARWorldTrackingConfiguration()
+        if let semantic = handTracker.depthMode.frameSemantic {
+            configuration.frameSemantics.insert(semantic)
+        }
+        print("[ARSession] video format \(configuration.videoFormat.imageResolution) @ \(configuration.videoFormat.framesPerSecond) fps")
 
         session.run(configuration)
     }
@@ -122,6 +154,8 @@ class ViewController: UIViewController, MTKViewDelegate, ARSessionDelegate {
         super.viewWillDisappear(animated)
 
         session.pause()
+        lidarCapture?.stop()
+        motionSensor.stop()
         connectionViewModel.webSocketClient.disconnect()
     }
 
@@ -158,6 +192,7 @@ class ViewController: UIViewController, MTKViewDelegate, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         handTracker.processFrame(frame)
         cameraFrameStreamer.processFrame(frame)
+
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
@@ -172,17 +207,15 @@ class ViewController: UIViewController, MTKViewDelegate, ARSessionDelegate {
 
     // MARK: - Hand Frame Streaming
 
-    private func sendHandFrame(observations: [HandObservation], scene: SceneContext, timestamp: TimeInterval) {
+    /// Main-thread side of a tracked frame: on-screen state and the first-hand cue. The frame
+    /// itself was already sent from the tracking queue by `FrameSender`.
+    private func showTrackedFrame(_ tracked: TrackedFrame) {
+        let observations = tracked.hands
         connectionViewModel.handsDetected = observations.count
         renderer.handObservations = observations
-
-        let message = HandFrameMessage(
-            hands: observations,
-            timestamp: timestamp,
-            scene: ScenePayload(from: scene, observations: observations)
-        )
-
-        guard let jsonString = MessageEncoder.encode(message) else { return }
-        connectionViewModel.send(jsonString)
+        if !observations.isEmpty, let id = connectionViewModel.sourceId, firstHandCuedFor != id {
+            firstHandCuedFor = id
+            Cues.firstHand()
+        }
     }
 }

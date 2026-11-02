@@ -15,7 +15,14 @@ enum ConnectionState: Sendable, Equatable {
 /// WebSocket client that connects to a relay endpoint and pushes data upstream.
 /// Uses URLSessionWebSocketTask for proper HTTP upgrade handshake with ws:// URLs.
 nonisolated class WebSocketClient: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
-    private var webSocketTask: URLSessionWebSocketTask?
+    /// Read from the hand-tracking queue (sends) as well as main and the URLSession delegate
+    /// queue, so access is locked.
+    private let taskLock = NSLock()
+    private var _webSocketTask: URLSessionWebSocketTask?
+    private var webSocketTask: URLSessionWebSocketTask? {
+        get { taskLock.withLock { _webSocketTask } }
+        set { taskLock.withLock { _webSocketTask = newValue } }
+    }
     private var urlSession: URLSession!
 
     var onStateChanged: ((@Sendable (ConnectionState) -> Void))?
@@ -60,14 +67,30 @@ nonisolated class WebSocketClient: NSObject, URLSessionWebSocketDelegate, @unche
     }
 
     func disconnect() {
-        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        guard let task = webSocketTask else { return }
         webSocketTask = nil
+        task.cancel(with: .goingAway, reason: nil)
+        // The cancelled task's own delegate callbacks are dropped as stale (see isCurrent), so
+        // report the close here.
+        notifyState(.disconnected)
     }
 
-    func send(_ string: String) {
+    /// Delegate callbacks for a task that has since been replaced or cancelled must not touch
+    /// state: with auto-reconnect, a late failure from the previous socket would otherwise tear
+    /// down the connection that replaced it.
+    private func isCurrent(_ task: URLSessionTask) -> Bool {
+        task === webSocketTask
+    }
+
+    /// `captureTimestamp`, when given, feeds PipelineStats' capture→wire measurement (the send
+    /// completion fires once the frame has been handed to the network stack).
+    func send(_ string: String, captureTimestamp: TimeInterval? = nil) {
         webSocketTask?.send(.string(string)) { error in
             if let error = error {
                 print("[WebSocketClient] Send error: \(error)")
+            }
+            if let captureTimestamp {
+                PipelineStats.shared.sendCompleted(captureTimestamp: captureTimestamp, ok: error == nil)
             }
         }
     }
@@ -75,18 +98,23 @@ nonisolated class WebSocketClient: NSObject, URLSessionWebSocketDelegate, @unche
     // MARK: - URLSessionWebSocketDelegate
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
+        guard isCurrent(webSocketTask) else { return }
         print("[WebSocketClient] Connected")
         notifyState(.connected)
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        guard isCurrent(webSocketTask) else { return }
         print("[WebSocketClient] Closed (code: \(closeCode))")
+        self.webSocketTask = nil  // stop queuing sends onto a dead socket
         notifyState(.disconnected)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        guard isCurrent(task) else { return }
         if let error = error {
             print("[WebSocketClient] Connection error: \(error)")
+            webSocketTask = nil
             notifyState(.failed(error.localizedDescription))
         }
     }

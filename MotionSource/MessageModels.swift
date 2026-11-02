@@ -7,10 +7,11 @@
 //
 
 import Foundation
+import QuartzCore
 
 // MARK: - Shared Encoder
 
-enum MessageEncoder {
+nonisolated enum MessageEncoder {
     static let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [] // compact
@@ -25,14 +26,52 @@ enum MessageEncoder {
 
 // MARK: - Hand Frame Message
 
-struct HandFrameMessage: Encodable {
+/// hand-wire v2 (see docs/hand-wire-v2.md). v1 fields (`hands[].landmarks`, `scene`) are kept.
+nonisolated struct HandFrameMessage: Encodable {
     let type = "handFrame"
+    let v = 2
+    let timestamp: TimeInterval      // ARFrame capture time, device monotonic clock (s)
+    let sentAt: TimeInterval = CACurrentMediaTime()  // same clock, stamped as the frame is built for sending
+    let mount: String                // faceDown | faceUp | upright | unknown, from gravity
+    let device: DevicePayload?       // nil until CoreMotion has a sample
+    let ceiling: Float?              // meters along PHONE +z; nil = unknown
     let hands: [HandObservation]
-    let timestamp: TimeInterval
+    let cloud: CloudBlock?           // whole depth map (roi = full), ~1 Hz; absent otherwise
     let scene: ScenePayload
+
+    private enum CodingKeys: String, CodingKey { case type, v, timestamp, sentAt, mount, device, ceiling, hands, cloud, scene }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(type, forKey: .type)
+        try c.encode(v, forKey: .v)
+        try c.encode(timestamp, forKey: .timestamp)
+        try c.encode(sentAt, forKey: .sentAt)
+        try c.encode(mount, forKey: .mount)
+        // Explicit nulls: the contract says "null when unknown", not "absent".
+        if let device { try c.encode(device, forKey: .device) } else { try c.encodeNil(forKey: .device) }
+        if let ceiling { try c.encode((ceiling * 1000).rounded() / 1000, forKey: .ceiling) }
+        else { try c.encodeNil(forKey: .ceiling) }
+        try c.encode(hands, forKey: .hands)
+        try c.encodeIfPresent(cloud, forKey: .cloud)
+        try c.encode(scene, forKey: .scene)
+    }
 }
 
-struct ScenePayload: Encodable {
+nonisolated struct DevicePayload: Encodable {
+    let gravity: [Float]    // unit vector, PHONE frame
+    let attitude: [Float]   // [qx, qy, qz, qw], PHONE frame vs CoreMotion xArbitraryZVertical
+    let userAcceleration: [Float]  // m/s², gravity removed, PHONE frame (latest 100 Hz sample)
+
+    init(_ sample: MotionSample) {
+        let r: (Float) -> Float = { ($0 * 10000).rounded() / 10000 }
+        gravity = [r(sample.gravity.x), r(sample.gravity.y), r(sample.gravity.z)]
+        attitude = [r(sample.attitude.x), r(sample.attitude.y), r(sample.attitude.z), r(sample.attitude.w)]
+        userAcceleration = [r(sample.userAcceleration.x), r(sample.userAcceleration.y), r(sample.userAcceleration.z)]
+    }
+}
+
+nonisolated struct ScenePayload: Encodable {
     let intrinsics: IntrinsicsPayload
     let imageResolution: [Int]
     let cameraTransform: [[Float]]
@@ -42,8 +81,8 @@ struct ScenePayload: Encodable {
 
     // High-water-mark depth range — only expands, never shrinks.
     // Converges to the camera's effective hand tracking volume over time.
-    private static var hwmMinZ: Float = .greatestFiniteMagnitude
-    private static var hwmMaxZ: Float = 0
+    nonisolated(unsafe) private static var hwmMinZ: Float = .greatestFiniteMagnitude
+    nonisolated(unsafe) private static var hwmMaxZ: Float = 0
 
     init(from ctx: SceneContext, observations: [HandObservation]) {
         let fx = ctx.intrinsicsFx
@@ -85,14 +124,14 @@ struct ScenePayload: Encodable {
     }
 }
 
-struct IntrinsicsPayload: Encodable {
+nonisolated struct IntrinsicsPayload: Encodable {
     let fx: Float
     let fy: Float
     let cx: Float
     let cy: Float
 }
 
-struct ViewportPayload: Encodable {
+nonisolated struct ViewportPayload: Encodable {
     let fovHorizontal: Float   // radians
     let fovVertical: Float     // radians
     let aspectRatio: Float

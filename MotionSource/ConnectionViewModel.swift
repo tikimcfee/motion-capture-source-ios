@@ -39,10 +39,10 @@ class ConnectionViewModel {
     /// is treated as a CLI controller with its frames parsed as commands.
     static let sourceGreeting = "SOURCE hand"
 
-    /// Fallback relay endpoint, used only until a connection succeeds once. Port
-    /// matches `glyph3d-cli serve` (8080); the host moves with DHCP and is
-    /// expected to be edited in the UI.
-    static let defaultAddress = "ws://192.168.50.249:8080"
+    /// Placeholder relay endpoint, shown only until a connection succeeds once (the last working
+    /// address is remembered) or `-relayAddress` is passed at launch. Port matches
+    /// `glyph3d-cli serve` (8080); edit the host in the UI.
+    static let defaultAddress = "ws://relay-host:8080"
 
     /// Where the last *successful* connection was made. Deliberately not written
     /// on every edit: the address field is a live-bound TextField, so persisting
@@ -63,6 +63,25 @@ class ConnectionViewModel {
     let webSocketClient = WebSocketClient()
     let onAppearOnce = DoOnce()
 
+    /// Hands-free: once the phone is face-down nobody can tap Connect, so a dropped or failed
+    /// connection retries on its own until the user explicitly disconnects.
+    private var userDisconnected = false
+    private var retryTask: Task<Void, Never>?
+    static let retryDelay: Duration = .seconds(2)
+    /// A connect to an unreachable host can sit in `.connecting` for a minute; give up sooner.
+    static let connectTimeout: Duration = .seconds(6)
+
+    /// Launch-argument override (`-relayAddress ws://host:port`, e.g. from
+    /// `xcrun devicectl device process launch … -relayAddress ws://…`), so the endpoint can be set
+    /// without touching the screen. Read from the argument domain only, never persisted here; a
+    /// successful connection persists it like any other address.
+    private static var launchArgumentAddress: String? {
+        let args = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+        guard let value = args["relayAddress"] as? String,
+              !value.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        return value
+    }
+
     init() {
         // Restore the last endpoint that worked. An empty stored value is treated
         // as absent so a cleared field can't brick the next launch.
@@ -70,25 +89,35 @@ class ConnectionViewModel {
            !saved.trimmingCharacters(in: .whitespaces).isEmpty {
             address = saved
         }
+        if let override = Self.launchArgumentAddress {
+            address = override
+        }
 
         webSocketClient.onStateChanged = { [weak self] newState in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.state = newState
-                if newState == .connected {
+                switch newState {
+                case .connected:
                     // Only a real open proves the endpoint is reachable — that is
                     // what's worth remembering for next launch.
                     UserDefaults.standard.set(self.address, forKey: Self.addressKey)
-                } else {
+                case .connecting:
+                    self.sourceId = nil
+                    self.scheduleRetry(after: Self.connectTimeout, ifStillIn: .connecting)
+                case .disconnected, .failed:
                     // A dropped connection invalidates the assigned id; the relay
                     // issues a fresh one on reconnect.
+                    if self.sourceId != nil { Cues.connectionLost() }
                     self.sourceId = nil
+                    if !self.userDisconnected { self.scheduleRetry(after: Self.retryDelay, ifStillIn: nil) }
                 }
             }
         }
         webSocketClient.onRegistered = { [weak self] id in
             Task { @MainActor [weak self] in
                 self?.sourceId = id
+                Cues.registered()
             }
         }
         refreshDeviceIP()
@@ -106,18 +135,35 @@ class ConnectionViewModel {
         case .disconnected, .failed:
             openConnection()
         case .connecting, .connected:
+            userDisconnected = true
+            retryTask?.cancel()
             webSocketClient.disconnect()
+        }
+    }
+
+    /// Retry the connection after `delay`, unless the user disconnected meanwhile or (when
+    /// `ifStillIn` is given) the state moved on. A newer schedule replaces an older one.
+    private func scheduleRetry(after delay: Duration, ifStillIn expected: ConnectionState?) {
+        retryTask?.cancel()
+        retryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, !Task.isCancelled, !self.userDisconnected else { return }
+            if let expected, self.state != expected { return }
+            if expected == nil, self.state == .connected || self.state == .connecting { return }
+            print("[Connection] retrying \(self.address)")
+            self.openConnection()
         }
     }
 
     /// Single funnel for every connect, so no call site can open a socket without
     /// announcing what this device is.
     private func openConnection() {
+        userDisconnected = false
         webSocketClient.connect(to: address, greeting: Self.sourceGreeting)
     }
 
-    func send(_ string: String) {
-        webSocketClient.send(string)
+    func send(_ string: String, captureTimestamp: TimeInterval? = nil) {
+        webSocketClient.send(string, captureTimestamp: captureTimestamp)
     }
 
     func refreshDeviceIP() {

@@ -33,15 +33,18 @@ nonisolated class CameraFrameStreamer: @unchecked Sendable {
 
     /// Feed every ARFrame here — internally throttles and drops if still encoding.
     func processFrame(_ frame: ARFrame) {
-        let now = frame.timestamp
+        processFrame(pixelBuffer: frame.capturedImage, timestamp: frame.timestamp)
+    }
+
+    /// Same, for any native landscape-right camera buffer (the AVFoundation pipeline).
+    func processFrame(pixelBuffer: CVPixelBuffer, timestamp: TimeInterval) {
+        let now = timestamp
         guard now - lastSendTime >= sendInterval else { return }
         guard !isEncoding else { return }
 
         isEncoding = true
         lastSendTime = now
-
-        let pixelBuffer = frame.capturedImage
-        let timestamp = frame.timestamp
+        nonisolated(unsafe) let pixelBuffer = pixelBuffer
 
         encodeQueue.async { [weak self] in
             guard let self = self else { return }
